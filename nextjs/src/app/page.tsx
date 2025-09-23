@@ -1,7 +1,36 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
+import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js';
+import { Line } from 'react-chartjs-2';
+
+// Global variables for Chart.js plugin
+let globalLastBeepTime = 0;
+let globalPlayBeep: (() => void) | null = null;
+
+// Chart.js plugin for synchronized beeping
+const beepPlugin = {
+  id: 'beepPlugin',
+  afterDraw: (chart: any) => {
+    // Check if we have new red points that need beeping
+    const dataset = chart.data.datasets[0]; // RMS dataset
+    if (!dataset || !dataset.data) return;
+
+    const currentDataLength = dataset.data.length;
+    if (currentDataLength > 0) {
+      const lastPoint = dataset.data[currentDataLength - 1];
+      if (lastPoint > THRESHOLD) {
+        // Beep if cooldown allows
+        if (globalPlayBeep && Date.now() - globalLastBeepTime > 2000) {
+          globalLastBeepTime = Date.now();
+          globalPlayBeep();
+        }
+      }
+    }
+  }
+};
+
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, beepPlugin);
 
 const THRESHOLD = 0.05;
 const SAMPLE_RATE = 44100;
@@ -9,6 +38,7 @@ const BLOCK_SIZE = 1; // seconds
 
 export default function AudioAlarm() {
   const [rmsData, setRmsData] = useState<{ time: number; rms: number }[]>([]);
+  const [currentRms, setCurrentRms] = useState<number>(0);
   const [isAlarm, setIsAlarm] = useState(false);
   const [isMonitoring, setIsMonitoring] = useState(false);
   const [chartKey, setChartKey] = useState(0);
@@ -17,8 +47,11 @@ export default function AudioAlarm() {
   const microphoneRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const rmsDisplayIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const startTimeRef = useRef<number>(0);
   const lastBeepTimeRef = useRef<number>(0);
+  const lastGraphUpdateRef = useRef<number>(0);
 
   const playBeep = () => {
     if (!audioContextRef.current) return;
@@ -46,7 +79,35 @@ export default function AudioAlarm() {
     return Math.sqrt(sum / buffer.length);
   };
 
-  const monitorAudio = () => {
+  const checkAlarm = () => {
+    if (!analyserRef.current) return;
+
+    const bufferLength = analyserRef.current.frequencyBinCount;
+    const dataArray = new Float32Array(bufferLength);
+    analyserRef.current.getFloatTimeDomainData(dataArray);
+
+    const rms = calculateRMS(dataArray);
+
+    if (rms > THRESHOLD) {
+      setIsAlarm(true);
+      setTimeout(() => setIsAlarm(false), 1000);
+    }
+
+    animationFrameRef.current = requestAnimationFrame(checkAlarm);
+  };
+
+  const updateCurrentRms = () => {
+    if (!analyserRef.current) return;
+
+    const bufferLength = analyserRef.current.frequencyBinCount;
+    const dataArray = new Float32Array(bufferLength);
+    analyserRef.current.getFloatTimeDomainData(dataArray);
+
+    const rms = calculateRMS(dataArray);
+    setCurrentRms(rms);
+  };
+
+  const updateGraph = () => {
     if (!analyserRef.current) return;
 
     const bufferLength = analyserRef.current.frequencyBinCount;
@@ -58,24 +119,16 @@ export default function AudioAlarm() {
 
     setRmsData(prev => {
       const newData = [...prev, { time: currentTime, rms }];
-      return newData.slice(-50); // Keep last 50 points
+      return newData.slice(-50); // Keep last 50 points for continuous session view
     });
-    setChartKey(prev => prev + 1);
 
-    if (rms > THRESHOLD) {
-      setIsAlarm(true);
-      if (Date.now() - lastBeepTimeRef.current > 2000) {
-        lastBeepTimeRef.current = Date.now();
-        playBeep();
-      }
-      setTimeout(() => setIsAlarm(false), 1000);
-    }
-
-    animationFrameRef.current = requestAnimationFrame(monitorAudio);
+    setChartKey(prev => prev + 1); // Force chart re-render
   };
 
   const startMonitoring = async () => {
     try {
+      setRmsData([]); // Clear previous data
+      setChartKey(0); // Reset chart key
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
@@ -88,8 +141,11 @@ export default function AudioAlarm() {
       microphoneRef.current.connect(analyserRef.current);
 
       startTimeRef.current = Date.now();
+      lastGraphUpdateRef.current = Date.now();
       setIsMonitoring(true);
-      monitorAudio();
+      checkAlarm();
+      intervalRef.current = setInterval(updateGraph, 1000);
+      rmsDisplayIntervalRef.current = setInterval(updateCurrentRms, 500);
     } catch (error) {
       console.error('Error accessing microphone:', error);
       alert('Microphone access denied or not available.');
@@ -100,6 +156,12 @@ export default function AudioAlarm() {
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
     }
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+    }
+    if (rmsDisplayIntervalRef.current) {
+      clearInterval(rmsDisplayIntervalRef.current);
+    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
     }
@@ -107,9 +169,14 @@ export default function AudioAlarm() {
       audioContextRef.current.close();
     }
     setIsMonitoring(false);
+    setCurrentRms(0); // Reset current RMS when stopping
   };
 
   useEffect(() => {
+    // Set global functions for Chart.js plugin
+    globalPlayBeep = playBeep;
+    globalLastBeepTime = lastBeepTimeRef.current;
+
     return () => {
       stopMonitoring();
     };
@@ -117,11 +184,6 @@ export default function AudioAlarm() {
 
   return (
     <div className="min-h-screen bg-gray-100 dark:bg-gray-900 p-4">
-      {isAlarm && (
-        <div className="fixed top-4 right-4 bg-red-500 text-white px-6 py-3 rounded-lg text-lg font-bold animate-pulse shadow-lg z-50">
-          ⚠️ ALARM: Loud sound detected!
-        </div>
-      )}
       <div className="max-w-6xl mx-auto">
         <h1 className="text-3xl font-bold text-center mb-8 text-gray-800 dark:text-white">
           Real-time Audio RMS Monitor
@@ -146,30 +208,64 @@ export default function AudioAlarm() {
             )}
           </div>
 
+          {isMonitoring && (
+            <div className="text-center mb-4">
+              <div className="inline-block bg-gray-100 dark:bg-gray-700 rounded-lg px-6 py-3">
+                <div className="text-sm text-gray-600 dark:text-gray-400">Current RMS</div>
+                <div className={`text-2xl font-mono font-bold ${currentRms > THRESHOLD ? 'text-red-500' : 'text-green-500'}`}>
+                  {currentRms.toFixed(5)}
+                </div>
+              </div>
+            </div>
+          )}
+
           <div className="h-96">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart key={chartKey} data={rmsData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="time"
-                  type="number"
-                  domain={['dataMin', 'dataMax']}
-                  label={{ value: 'Time (s)', position: 'insideBottom', offset: -5 }}
-                />
-                <YAxis
-                  label={{ value: 'RMS', angle: -90, position: 'insideLeft' }}
-                />
-                <Tooltip />
-                <ReferenceLine y={THRESHOLD} stroke="red" strokeDasharray="5 5" />
-                <Line
-                  type="monotone"
-                  dataKey="rms"
-                  stroke="#8884d8"
-                  dot={false}
-                  strokeWidth={2}
-                />
-              </LineChart>
-            </ResponsiveContainer>
+            <Line
+              data={{
+                labels: rmsData.map((_, index) => index),
+                datasets: [
+                  {
+                    label: 'RMS Value',
+                    data: rmsData.map(d => d.rms),
+                    borderColor: 'rgba(75, 192, 192, 1)',
+                    backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                    fill: false,
+                    pointRadius: 5,
+                    pointBackgroundColor: function(context: any) {
+                      return context.parsed && context.parsed.y > THRESHOLD ? 'red' : 'rgba(75, 192, 192, 1)';
+                    }
+                  },
+                  {
+                    label: 'Threshold',
+                    data: rmsData.map(() => THRESHOLD),
+                    borderColor: 'rgba(255, 99, 132, 1)',
+                    borderDash: [5, 5],
+                    fill: false,
+                    pointRadius: 0
+                  }
+                ]
+              }}
+              options={{
+                scales: {
+                  x: {
+                    type: 'linear',
+                    position: 'bottom',
+                    title: {
+                      display: true,
+                      text: 'Time (s)'
+                    }
+                  },
+                  y: {
+                    title: {
+                      display: true,
+                      text: 'RMS'
+                    }
+                  }
+                },
+                animation: false,
+                maintainAspectRatio: false
+              }}
+            />
           </div>
         </div>
 
