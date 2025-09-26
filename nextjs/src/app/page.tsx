@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js';
+import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Chart } from 'chart.js';
 import { Line } from 'react-chartjs-2';
 
 // Global variables for Chart.js plugin
@@ -11,7 +11,7 @@ let globalPlayBeep: (() => void) | null = null;
 // Chart.js plugin for synchronized beeping
 const beepPlugin = {
   id: 'beepPlugin',
-  afterDraw: (chart: any) => {
+  afterDraw: (chart: Chart) => {
     // Check if we have new red points that need beeping
     const dataset = chart.data.datasets[0]; // RMS dataset
     if (!dataset || !dataset.data) return;
@@ -19,7 +19,7 @@ const beepPlugin = {
     const currentDataLength = dataset.data.length;
     if (currentDataLength > 0) {
       const lastPoint = dataset.data[currentDataLength - 1];
-      if (lastPoint > THRESHOLD) {
+      if (lastPoint !== null && typeof lastPoint === 'number' && lastPoint > THRESHOLD) {
         // Beep if cooldown allows
         if (globalPlayBeep && Date.now() - globalLastBeepTime > 2000) {
           globalLastBeepTime = Date.now();
@@ -34,14 +34,11 @@ ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, T
 
 const THRESHOLD = 0.05;
 const SAMPLE_RATE = 44100;
-const BLOCK_SIZE = 1; // seconds
 
 export default function AudioAlarm() {
   const [rmsData, setRmsData] = useState<{ time: number; rms: number }[]>([]);
   const [currentRms, setCurrentRms] = useState<number>(0);
-  const [isAlarm, setIsAlarm] = useState(false);
   const [isMonitoring, setIsMonitoring] = useState(false);
-  const [chartKey, setChartKey] = useState(0);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const microphoneRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -89,8 +86,7 @@ export default function AudioAlarm() {
     const rms = calculateRMS(dataArray);
 
     if (rms > THRESHOLD) {
-      setIsAlarm(true);
-      setTimeout(() => setIsAlarm(false), 1000);
+      // Alarm logic can be added here if needed
     }
 
     animationFrameRef.current = requestAnimationFrame(checkAlarm);
@@ -121,18 +117,15 @@ export default function AudioAlarm() {
       const newData = [...prev, { time: currentTime, rms }];
       return newData.slice(-50); // Keep last 50 points for continuous session view
     });
-
-    setChartKey(prev => prev + 1); // Force chart re-render
   };
 
   const startMonitoring = async () => {
     try {
       setRmsData([]); // Clear previous data
-      setChartKey(0); // Reset chart key
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioContextRef.current = new (window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext)();
       analyserRef.current = audioContextRef.current.createAnalyser();
       analyserRef.current.fftSize = 2048;
       analyserRef.current.smoothingTimeConstant = 0.8;
@@ -231,7 +224,7 @@ export default function AudioAlarm() {
                     backgroundColor: 'rgba(75, 192, 192, 0.2)',
                     fill: false,
                     pointRadius: 5,
-                    pointBackgroundColor: function(context: any) {
+                    pointBackgroundColor: function(context: { parsed?: { y: number } }) {
                       return context.parsed && context.parsed.y > THRESHOLD ? 'red' : 'rgba(75, 192, 192, 1)';
                     }
                   },
